@@ -30,6 +30,10 @@ _EPS13 = _EPS ** (1.0 / 3.0)
 # 相关矩阵
 # ---------------------------------------------------------------------------
 
+#: 半正定判据：最小特征值低于该阈值视为明显非 PSD，必须拒绝
+PSD_EIG_TOL = 1e-8
+
+
 def build_correlation_matrix(
     names: tuple[str, ...],
     pairs: list[tuple[str, str, float]],
@@ -39,8 +43,10 @@ def build_correlation_matrix(
 
     * 对称、对角为 1、|r| <= 1；
     * 不允许引用标准不确定度为 0 的输入量（相关系数在那里无定义）；
-    * 必须半正定；对微小负特征值（浮点误差级别）做钳位修复，
-      明显非半正定则拒绝。
+    * 必须半正定（允许奇异：完全相关 r = ±1 时零特征值是合法的）；
+      最小特征值低于 :data:`PSD_EIG_TOL`（-1e-8）明显非半正定则拒绝；
+      处于 [-1e-8, 0) 的微小负特征值视为舍入误差，投影到最近相关矩阵
+      （半正定 + 保持单位对角）后放行。
     """
     n = len(names)
     idx = {name: k for k, name in enumerate(names)}
@@ -69,23 +75,100 @@ def build_correlation_matrix(
         return rmat
 
     eig = np.linalg.eigvalsh(rmat)
-    # 允许 1e-8 绝对量级 + 与最大特征值成正比的浮点误差
-    tol = max(1e-8, n * _EPS * eig[-1])
-    if eig[0] < -tol:
+    # 奇异半正定矩阵（如 r 恰为 ±1 时存在零特征值）是合法的，不要求正定；
+    # 仅把最小特征值低于 -1e-8 的明显非 PSD 矩阵判为非法。
+    if eig[0] < -PSD_EIG_TOL:
         worst = eig[0]
         raise CorrelationError(
-            f"相关矩阵不是半正定矩阵：最小特征值 {worst:.3e} < -{tol:.1e}"
+            f"相关矩阵不是半正定矩阵：最小特征值 {worst:.3e} < -{PSD_EIG_TOL:.0e}"
         )
 
-    # 浮点钳位：用 Higham 交替投影把矩阵投影到相关矩阵锥（保对角 1 + 半正定）
-    if eig[0] < 0:
+    # 浮点钳位：仅 [-1e-8, 0) 的舍入误差级负特征值需要修复。
+    # 用 Higham 交替投影把矩阵投影到相关矩阵锥（保对角 1 + 半正定）。
+    # 注意：最小特征值恰为 0 的奇异矩阵（完全相关）保持原样，不做修复。
+    if eig[0] < 0.0:
         rmat = _nearest_correlation_matrix(rmat)
 
-    try:
-        np.linalg.cholesky(rmat)
-    except np.linalg.LinAlgError as exc:
-        raise CorrelationError("相关矩阵无法进行 Cholesky 分解") from exc
+    # 终检：对称、单位对角、半正定（允许零特征值），不再要求 Cholesky 可分解
+    rmat = 0.5 * (rmat + rmat.T)
+    np.fill_diagonal(rmat, 1.0)
+    final_min = float(np.min(np.linalg.eigvalsh(rmat)))
+    if final_min < -1e-12:
+        raise CorrelationError(
+            f"相关矩阵修复后仍不是半正定矩阵：最小特征值 {final_min:.3e}"
+        )
     return rmat
+
+
+def correlation_factor(corr: np.ndarray) -> np.ndarray:
+    """返回因子 F，使相关标准正态 Z = F W（W 为独立标准正态）且 F F^T = corr。
+
+    正定矩阵直接走 Cholesky（与历史实现逐位一致，固定种子流不变）；
+    奇异半正定矩阵（含合法零特征值，如 r = ±1 的完全相关）Cholesky 会失败，
+    此时改用特征分解的对称平方根 F = Q sqrt(Λ) Q^T：
+
+    * r = +1 时两列完全相同，两个标准化输入同向变化；
+    * r = -1 时两列正好反号，两个标准化输入反向变化。
+    """
+    try:
+        return np.linalg.cholesky(corr)
+    except np.linalg.LinAlgError:
+        evals, evecs = np.linalg.eigh(corr)
+        if float(np.min(evals)) < -1e-10:
+            raise CorrelationError("相关矩阵不是半正定矩阵，无法构造抽样因子")
+        evals = np.clip(evals, 0.0, None)
+        factor = (evecs * np.sqrt(evals)) @ evecs.T
+        return 0.5 * (factor + factor.T)
+
+
+def _align_perfectly_correlated(z: np.ndarray, corr: np.ndarray) -> np.ndarray:
+    """对相关系数恰为 ±1 的输入对，强制标准化正态行严格同向/反向。
+
+    奇异因子在高阶完全相关块上可能留下 ~1e-15 的特征向量正交化残差；
+    用带权并查集沿 ``r = ±1`` 的边传播符号后，r = +1 的两行逐位相同、
+    r = -1 的两行逐位相反。正态边际直接使用 z（不经 CDF/分位往返近似），
+    故 y = a + b 的两个标准化输入严格同向或反向变化，r = -1 且 ua = ub 时
+    输出严格为常数。
+
+    仅作用于矩阵中**精确存储**为 ±1.0 的边：非奇异矩阵与经舍入修复的
+    近奇异矩阵（相关系数为 1±δ）逐位不变。
+    """
+    n = corr.shape[0]
+    perfect = [
+        (i, j, float(corr[i, j]))
+        for i in range(n) for j in range(i + 1, n)
+        if corr[i, j] == 1.0 or corr[i, j] == -1.0
+    ]
+    if not perfect:
+        return z
+
+    parent = list(range(n))
+    weight = [1.0] * n  # z_i = weight[i] * z_root（分量根为 parent 链顶）
+
+    def root_sign(i: int) -> tuple[int, float]:
+        s = 1.0
+        while parent[i] != i:
+            s *= weight[i]
+            i = parent[i]
+        return i, s
+
+    for i, j, rij in perfect:
+        ri, si = root_sign(i)
+        rj, sj = root_sign(j)
+        if ri == rj:
+            continue  # 符号矛盾的块最小特征值为 -2 量级，已在 PSD 校验拒绝
+        # z_i = si·z_ri = rij·z_j = rij·sj·z_rj  =>  z_rj = rij·si·sj·z_ri
+        parent[rj] = ri
+        weight[rj] = rij * si * sj
+
+    out = z
+    for i in range(n):
+        ri, si = root_sign(i)
+        if ri != i:
+            if out is z:
+                out = z.copy()
+            out[i] = si * z[ri]  # 根行从不被改写，引用的始终是原始行
+    return out
 
 
 def _nearest_correlation_matrix(a: np.ndarray, max_iter: int = 100) -> np.ndarray:
@@ -232,7 +315,13 @@ def run_gum(
     grad_base = numerical_gradient(compiled, x_base, names)
     cov = (std_base[:, None] * corr * std_base[None, :])
     var_y = float(grad_base @ cov @ grad_base)
-    if var_y < 0 and var_y > -_EPS * max(1.0, abs(grad_base @ (np.diag(np.diag(cov))) @ grad_base)):
+    # 机器精度尺度：各不确定度项单独贡献之和（与相关结构无关，非负）
+    diag_scale = float(grad_base @ np.diag(np.diag(cov)) @ grad_base)
+    var_floor = _EPS * max(1.0, abs(diag_scale))
+    # 完全相关抵消（r = -1、梯度与标准差逐项匹配）时，理论方差恰为 0；
+    # 矩阵乘法次序会残留 ±1e-12 量级的浮点噪声（可正可负），统一钳为 0。
+    # 仅钳机器精度级别残差，真实小方差（uc 远大于 0）不受影响。
+    if -var_floor <= var_y <= var_floor:
         var_y = 0.0
     if var_y < 0:
         raise PropagationError(f"GUM 合成方差为负 ({var_y:.3e})")
@@ -322,19 +411,32 @@ def run_monte_carlo(
     n = len(names)
     means = np.array([x_base[name] for name in names], dtype=float)
 
-    # 相关标准正态：Z = L W
-    try:
-        lower = np.linalg.cholesky(corr)
-    except np.linalg.LinAlgError as exc:  # pragma: no cover - 前面已校验
-        raise CorrelationError("相关矩阵无法进行 Cholesky 分解") from exc
+    # 相关标准正态：Z = F W。奇异半正定相关矩阵（r = ±1 完全相关）同样可抽样：
+    # r = +1 时对应行逐位相同（同向变化），r = -1 时恰好反号（反向变化）。
+    lower = correlation_factor(corr)
     w = rng.standard_normal(size=(n, n_draws))
     z = lower @ w
+    # r 恰为 ±1 的完全相关边：强制标准化正态严格同向/反向（消除分解残差）
+    has_perfect = bool(np.any(np.abs(corr - np.eye(n)) >= 1.0))
+    if has_perfect:
+        z = _align_perfectly_correlated(z, corr)
+
+    # Gaussian copula：标准正态 -> 均匀概率 -> 目标边际分位数。
+    # 正态边际在历史实现中也走 phi/ppf 往返；为保持非奇异请求的固定种子流
+    # 逐位不变，这里默认沿用该路径。仅当相关结构含 r = ±1 完全相关边时，
+    # 正态边际直接使用 z（z 本身就是精确标准正态样本）——phi/ppf 往返近似
+    # 会在完全反相（r = -1）时留下残差噪声，使本该严格抵消的 y = a + b
+    # 不抵消，并可能把退化（零方差）输出误判为不收敛。
+    # 非正态边际（均匀/三角）始终经 CDF 变换以保持精确边际分布。
     u = _phi(z)
     u = np.clip(u, 1e-12, 1 - 1e-12)  # 数值保护
 
     draws = np.empty((n, n_draws))
     for k, dist in enumerate(distributions):
-        draws[k] = means[k] + std_base[k] * _marginal_unit_samples(dist, u[k])
+        if dist == "normal" and has_perfect:
+            draws[k] = means[k] + std_base[k] * z[k]
+        else:
+            draws[k] = means[k] + std_base[k] * _marginal_unit_samples(dist, u[k])
 
     env = {name: draws[k] for k, name in enumerate(names)}
     # 抽样可能越过模型定义域（如 sqrt/log），numpy 会给出 NaN + RuntimeWarning；

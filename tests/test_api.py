@@ -283,3 +283,178 @@ def test_domain_negative_log_rejected(client):
     r = client.post("/api/v1/evaluations", json=p)
     assert r.status_code == 422
     assert "非有限" in r.json()["message"]
+
+
+# ---------------------------------------------------------------------------
+# 奇异半正定相关矩阵（r 恰为 ±1，两个标准不确定度均 > 0）
+# ---------------------------------------------------------------------------
+
+def _sum_model(version: str, r: float) -> dict:
+    return {
+        "version": version,
+        "name": f"线性和 a+b，r={r}",
+        "expression": "a + b",
+        "inputs": [
+            {"name": "a", "value": 3.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+            {"name": "b", "value": 5.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.2, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [{"i": "a", "j": "b", "r": r}],
+    }
+
+
+def _sum_payload(version: str, r: float, key: str, n: int = 10000, seed: int = 1234) -> dict:
+    return {
+        "model_version": version,
+        "inputs": _sum_model(version, r)["inputs"],
+        "correlations": [{"i": "a", "j": "b", "r": r}],
+        "n": n,
+        "seed": seed,
+        "idempotency_key": key,
+    }
+
+
+def test_singular_correlation_models_register(client):
+    # 修复前：r=±1 触发 Cholesky 失败 → 422；修复后：必须登记成功
+    for version, r in (("sum-r-plus-v1", 1.0), ("sum-r-minus-v1", -1.0)):
+        r_resp = client.post("/api/v1/models", json=_sum_model(version, r))
+        assert r_resp.status_code == 201, r_resp.text
+        assert client.get(f"/api/v1/models/{version}").status_code == 200
+
+
+def test_perfect_positive_correlation_evaluation_and_query(client):
+    # r=+1：GUM uc = ua + ub = 0.3；MC 同向，标准差收敛到 0.3
+    p = _sum_payload("sum-r-plus-v1", 1.0, "key-0010-singular-plus")
+    r = client.post("/api/v1/evaluations", json=p)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    gum = body["result"]["combined"]["gum"]
+    assert abs(gum["value"] - 8.0) < 1e-9
+    assert abs(gum["standard_uncertainty"] - 0.3) < 1e-9
+    mc = body["result"]["combined"]["monte_carlo"]
+    assert abs(mc["standard_uncertainty"] - 0.3) < 1e-2
+    assert body["result"]["convergence"]["converged"] is True
+    eval_id = body["id"]
+
+    # 查询接口可用
+    one = client.get(f"/api/v1/evaluations/{eval_id}")
+    assert one.status_code == 200
+    assert one.json()["id"] == eval_id
+    by_key = client.get("/api/v1/idempotency/key-0010-singular-plus")
+    assert by_key.status_code == 200
+    assert by_key.json()["id"] == eval_id
+    listing = client.get("/api/v1/evaluations?model_version=sum-r-plus-v1")
+    assert listing.json()["count"] >= 1
+
+
+def test_perfect_negative_correlation_evaluation(client):
+    # r=-1：GUM uc = |ua - ub| = 0.1
+    p = _sum_payload("sum-r-minus-v1", -1.0, "key-0011-singular-minus")
+    r = client.post("/api/v1/evaluations", json=p)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    gum = body["result"]["combined"]["gum"]
+    assert abs(gum["value"] - 8.0) < 1e-9
+    assert abs(gum["standard_uncertainty"] - 0.1) < 1e-9
+
+    # 幂等重放仍可用（200 + cached）
+    r2 = client.post("/api/v1/evaluations", json=p)
+    assert r2.status_code == 200
+    assert r2.json()["cached"] is True
+    assert r2.json()["id"] == body["id"]
+
+
+def test_equal_uncertainty_anticorrelated_cancels(client):
+    # ua == ub、r=-1：完全反向抵消，GUM uc = 0，覆盖区间退化为点；仍可登记/计算/查询
+    m = {
+        "version": "sum-cancel-v1",
+        "expression": "a + b",
+        "inputs": [
+            {"name": "a", "value": 3.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+            {"name": "b", "value": 5.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [{"i": "a", "j": "b", "r": -1.0}],
+    }
+    r = client.post("/api/v1/models", json=m)
+    assert r.status_code == 201, r.text
+    p = {
+        "model_version": "sum-cancel-v1",
+        "inputs": m["inputs"],
+        "correlations": m["correlations"],
+        "n": 5000,
+        "seed": 99,
+        "idempotency_key": "key-0012-singular-cancel",
+    }
+    r = client.post("/api/v1/evaluations", json=p)
+    assert r.status_code == 201, r.text
+    gum = r.json()["result"]["combined"]["gum"]
+    assert gum["standard_uncertainty"] == 0.0
+    assert gum["coverage_interval"]["low"] == gum["coverage_interval"]["high"] == 8.0
+    assert client.get(
+        "/api/v1/idempotency/key-0012-singular-cancel"
+    ).status_code == 200
+
+
+def test_roundoff_negative_eigenvalue_registered_with_unit_diagonal(client):
+    # 最小特征值处于 [-1e-8, 0)：修复为 PSD 且保持单位对角后放行
+    m = {
+        "version": "near-singular-v1",
+        "expression": "a + b + c",
+        "inputs": [
+            {"name": "a", "value": 1.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+            {"name": "b", "value": 2.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+            {"name": "c", "value": 3.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [
+            {"i": "a", "j": "b", "r": 1.0 - 1e-11},
+            {"i": "a", "j": "c", "r": 1.0 - 1e-11},
+            {"i": "b", "j": "c", "r": 0.9999999995},
+        ],
+    }
+    r = client.post("/api/v1/models", json=m)
+    assert r.status_code == 201, r.text
+    p = {
+        "model_version": "near-singular-v1",
+        "inputs": m["inputs"],
+        "correlations": m["correlations"],
+        "n": 4000,
+        "seed": 5,
+        "idempotency_key": "key-0013-near-singular",
+    }
+    r = client.post("/api/v1/evaluations", json=p)
+    assert r.status_code == 201, r.text
+
+
+def test_below_threshold_still_rejected(client):
+    # 最小特征值低于 -1e-8 的矩阵仍须 422 拒绝，且不登记
+    m = {
+        "version": "below-threshold-v1",
+        "expression": "a + b + c",
+        "inputs": [
+            {"name": "a", "value": 1.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+            {"name": "b", "value": 2.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+            {"name": "c", "value": 3.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [
+            {"i": "a", "j": "b", "r": 1.0},
+            {"i": "b", "j": "c", "r": 1.0},
+            {"i": "a", "j": "c", "r": -1.0},
+        ],
+    }
+    r = client.post("/api/v1/models", json=m)
+    assert r.status_code == 422
+    assert "半正定" in r.json()["message"]
+    assert client.get("/api/v1/models/below-threshold-v1").status_code == 404

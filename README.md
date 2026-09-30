@@ -5,7 +5,7 @@
 客户端登记带单位的输入量（名义值、标准不确定度、分布、两两相关系数）与**不可变版本化测量模型**（表达式仅允许白名单算子/函数）；提交计算请求后，服务依次执行：
 
 1. **单位换算与维度校验**（Pint）——输入快照换算到模型声明单位，推导表达式量纲并与输出单位核对；
-2. **相关矩阵校验**——对称、对角为 1、|r|≤1、半正定（Cholesky；浮点误差级别的近奇异矩阵按 Higham 最近相关矩阵算法修复，明显非半正定拒绝）；
+2. **相关矩阵校验**——对称、对角为 1、|r|≤1、半正定（**允许奇异**：两个标准不确定度均大于零的输入相关系数恰为 ±1 时，矩阵含合法零特征值，直接接受；最小特征值低于 -1e-8 判为明显非半正定并拒绝；处于 [-1e-8, 0) 的舍入误差按 Higham 最近相关矩阵算法修复为半正定且保持单位对角）；
 3. **GUM 一阶线性化**（JCGM 100:2008）——合成标准不确定度、95% 覆盖区间、解析灵敏度系数与逐输入方差贡献；
 4. **固定种子蒙特卡洛**（N ∈ [1000, 100000]，Gaussian copula 保证相关结构与边际分布同时精确）——合成值、2.5%/97.5% 分位覆盖区间、逐输入相关贡献与收敛统计。
 
@@ -27,6 +27,7 @@
   - [4. 查询结果](#4-查询结果)
   - [5. 等价单位写法](#5-等价单位写法)
   - [6. 拒绝场景示例](#6-拒绝场景示例)
+  - [7. 完全相关（r = ±1，奇异半正定矩阵）](#7-完全相关r--1奇异半正定矩阵)
 - [模型表达式白名单](#模型表达式白名单)
 - [分布与相关系数](#分布与相关系数)
 - [结果字段说明](#结果字段说明)
@@ -240,7 +241,9 @@ curl -sS http://localhost:8000/api/v1/idempotency/demo-power-0001
 | 场景 | 状态码 | 错误示例 |
 | --- | --- | --- |
 | 表达式注入 / 非白名单结构（`__import__('os')`、属性访问、比较、lambda…） | 422 | `ExpressionError: 只允许调用白名单中的简单函数名` |
-| 非半正定相关矩阵 | 422 | `CorrelationError: 相关矩阵不是半正定矩阵：最小特征值 -8.000e-01 < -1.0e-08` |
+| 非半正定相关矩阵（最小特征值 < -1e-8） | 422 | `CorrelationError: 相关矩阵不是半正定矩阵：最小特征值 -8.000e-01 < -1e-08` |
+| 近奇异矩阵（最小特征值 ∈ [-1e-8, 0)） | 201/200 | 按舍入误差修复为半正定并保持单位对角，登记/计算照常进行 |
+| 完全相关 r = ±1（两个 u 均 > 0，矩阵奇异） | 201/200 | 零特征值合法；见[下节](#7-完全相关r--1奇异半正定矩阵) |
 | 表达式量纲矛盾（`m + kg`）/ 输出单位量纲不符 | 422 | `RequestError: 模型维度不兼容 ...` |
 | 快照与登记模型不一致（值/不确定度/分布/相关对） | 422 | `RequestError: 输入 'U' 的名义值与登记模型不符 ...` |
 | 相关系数引用 u=0 的输入量 | 422 | `CorrelationError: ... 引用了标准不确定度为 0 的输入量` |
@@ -248,6 +251,141 @@ curl -sS http://localhost:8000/api/v1/idempotency/demo-power-0001
 | 蒙特卡洛不收敛 | 422 | `ConvergenceError: 蒙特卡洛 N=1000 未通过收敛判据 ...` |
 | 抽样越过模型定义域（如对正态量取 sqrt/log 产生 NaN） | 422 | `PropagationError: 蒙特卡洛抽样中模型产生了 k/N 个非有限结果 ...` |
 | 幂等键绑定到不同请求 / 模型版本重复 | 409 | `ConflictError` |
+
+### 7. 完全相关（r = ±1，奇异半正定矩阵）
+
+两个输入的标准不确定度**均大于零**、相关系数恰为 **+1 或 −1** 时，相关矩阵的最小特征值为 **0**（奇异半正定，而非非半正定）。这是合法输入：登记返回 201，计算与查询照常进行。
+
+以线性模型 `y = a + b`（a = 3.0(10)，b = 5.0(20)，均无量纲、正态）为例，GUM 合成标准不确定度为
+
+```
+u(y) = |ua + r·ub|
+```
+
+即 r = +1 时 u(y) = 0.30（同向相加），r = −1 时 u(y) = 0.10（反向相减）。固定种子蒙特卡洛中，两个标准化输入**严格同向（r=+1）或反向（r=−1）变化**（逐样本位级一致/相反，不是近似），因此 MC 标准差收敛到同一解析值。
+
+**登记（r = +1）：**
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/models \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "sum-perfect-r1",
+    "name": "线性和 y=a+b（完全正相关）",
+    "expression": "a + b",
+    "inputs": [
+      {"name": "a", "value": 3.0, "unit": "dimensionless", "standard_uncertainty": 0.1, "distribution": "normal"},
+      {"name": "b", "value": 5.0, "unit": "dimensionless", "standard_uncertainty": 0.2, "distribution": "normal"}
+    ],
+    "output_unit": "dimensionless",
+    "correlations": [{"i": "a", "j": "b", "r": 1.0}]
+  }'
+# HTTP 201（奇异半正定矩阵被接受；summary.correlations = [["a","b",1.0]]）
+```
+
+**计算（N=20000，seed=20260930）：**
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/evaluations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "sum-perfect-r1",
+    "inputs": [
+      {"name": "a", "value": 3.0, "unit": "dimensionless", "standard_uncertainty": 0.1, "distribution": "normal"},
+      {"name": "b", "value": 5.0, "unit": "dimensionless", "standard_uncertainty": 0.2, "distribution": "normal"}
+    ],
+    "correlations": [{"i": "a", "j": "b", "r": 1.0}],
+    "n": 20000, "seed": 20260930, "idempotency_key": "doc-r1-0002"
+  }'
+```
+
+返回 `201`（以下为该种子下的**实际响应**节选，可复现）：
+
+```json
+{
+  "id": "49f2e458a02e4bcab90ded195c3a7225",
+  "cached": false,
+  "result": {
+    "combined": {
+      "gum": {
+        "value": 8.0,
+        "standard_uncertainty": 0.300000000004133,
+        "coverage_interval": {"low": 7.412010804629884, "high": 8.587989195370117},
+        "coverage_factor": 1.959963984540054,
+        "unit": "dimensionless"
+      },
+      "monte_carlo": {
+        "mean": 7.999672567876607,
+        "standard_uncertainty": 0.301707430632374,
+        "median": 7.997800889847241,
+        "coverage_interval": {"low": 7.410332065710037, "high": 8.59332288699073},
+        "samples_range": {"min": 6.780157415611496, "max": 9.190815122599634},
+        "unit": "dimensionless"
+      }
+    },
+    "contributions": {
+      "monte_carlo": [
+        {"source": "a", "pearson_r": 1.0, "r_squared": 1.0},
+        {"source": "b", "pearson_r": 1.0, "r_squared": 1.0}
+      ]
+    },
+    "convergence": {"n": 20000, "seed": 20260930, "converged": true}
+  }
+}
+```
+
+> GUM 值 0.300000000004 与精确值 0.30 的 4e-12 偏差来自中心差分灵敏度系数（∂y/∂a 数值为 1.000000000024），与相关矩阵是否奇异无关；MC 标准差 0.3017 是 N=20000 的抽样涨落（相对标准误约 0.5%）。
+
+把模型与请求中的 `r` 改成 **−1.0**（版本 `sum-perfect-rm1`、幂等键 `doc-rm1-0001`，其余不变），返回 `201`：
+
+```json
+{
+  "id": "246dcdef6e2d494b83e3d415d21a047c",
+  "result": {
+    "combined": {
+      "gum": {
+        "value": 8.0,
+        "standard_uncertainty": 0.099999999999422,
+        "coverage_interval": {"low": 7.804003601547127, "high": 8.195996398452872},
+        "unit": "dimensionless"
+      },
+      "monte_carlo": {
+        "mean": 7.999887180315274,
+        "standard_uncertainty": 0.100156418055492,
+        "coverage_interval": {"low": 7.800771459463655, "high": 8.196261317942582},
+        "samples_range": {"min": 7.628435460607403, "max": 8.392275772289075},
+        "unit": "dimensionless"
+      }
+    },
+    "contributions": {
+      "monte_carlo": [
+        {"source": "a", "pearson_r": -1.0, "r_squared": 1.0},
+        {"source": "b", "pearson_r": 1.0,  "r_squared": 1.0}
+      ]
+    }
+  }
+}
+```
+
+**完全抵消边界**：r = −1 且 ua = ub（如都为 0.1）时，两个标准化正态严格反向、逐项抵消，输出退化为确定值。GUM 与 MC 均给出 `standard_uncertainty = 0.0`、覆盖区间 `[8.0, 8.0]`，MC 的 `samples_range` 也是 `{min: 8.0, max: 8.0}`，收敛判据照常通过（版本 `sum-perfect-cancel`，N=5000，seed=77，幂等键 `doc-cancel-0001`）。
+
+查询接口对这些结果完全一致地可用：
+
+```bash
+curl -sS http://localhost:8000/api/v1/evaluations/49f2e458a02e4bcab90ded195c3a7225   # 200
+curl -sS http://localhost:8000/api/v1/idempotency/doc-r1-0002                        # 200
+curl -sS "http://localhost:8000/api/v1/evaluations?model_version=sum-perfect-r1"     # 200
+```
+
+**边界规则**（与实现一致）：
+
+| 最小特征值 | 处置 |
+| --- | --- |
+| = 0（r 恰为 ±1 的完全相关） | 接受，矩阵原样保留，零特征值可用于抽样 |
+| ∈ [−1e-8, 0)（舍入误差） | 投影到最近相关矩阵（半正定 + 保持单位对角）后接受 |
+| < −1e-8（明显非半正定） | 422 拒绝，不登记、不保存 |
+
+抽样实现上，正定矩阵仍走 Cholesky 分解（固定种子流与历史版本逐位一致）；奇异半正定矩阵改用特征分解的对称平方根 F = Q·√Λ·Qᵀ（F Fᵀ = 相关矩阵），并对矩阵中精确存储为 ±1 的边做符号对齐，因此 r=±1 时标准化正态行严格相同/相反。正态边际直接使用该标准正态样本（不经 CDF/分位往返），保证完全反相时严格抵消；均匀/三角边际仍经 Gaussian copula 变换保持精确边际分布。
 
 ## 模型表达式白名单
 
@@ -275,7 +413,7 @@ curl -sS http://localhost:8000/api/v1/idempotency/demo-power-0001
 | `uniform` | 以 x 为中心、宽度 2a 的均匀分布，u = a/√3 | x + u·√3·(2v−1) |
 | `triangular` | 对称三角分布（支撑 ±a，峰值在中心），u = a/√6 | x + u·√6·T，T∈[−1,1] |
 
-相关性通过 Gaussian copula 引入：先用 Cholesky 生成相关标准正态，再经正态 CDF 与目标分布分位数函数映射，因此**边际分布精确且相关结构正确**。
+相关性通过 Gaussian copula 引入：先用相关矩阵因子（正定走 Cholesky；奇异半正定走特征分解对称平方根）生成相关标准正态，再经正态 CDF 与目标分布分位数函数映射，因此**边际分布精确且相关结构正确**。r = ±1 的完全相关（含零特征值的奇异相关矩阵）同样支持：正态边际的两个标准化输入固定种子下严格同向/反向变化。
 
 ## 结果字段说明
 
@@ -304,7 +442,7 @@ pip install -r requirements.txt pytest httpx
 python -m pytest -q
 ```
 
-测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝/浮点修复、GUM 解析解对比、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口等（28 个用例）。
+测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝（< -1e-8）/舍入修复（[-1e-8,0)，保单位对角）/奇异接受（r=±1 零特征值）、r=±1 的 GUM 解析解 |ua+r·ub| 与 MC 同/反向传播、完全抵消退化为确定值、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口等（40 个用例）。
 
 ## 项目结构
 

@@ -119,6 +119,8 @@ def test_psd_repair_accepts_tiny_negative_eigenvalue():
     r = build_correlation_matrix(("a", "b", "c"), pairs, set())
     assert r.shape == (3, 3)
     assert np.all(np.linalg.eigvalsh(r) >= -1e-12)
+    # 修复必须保持单位对角
+    assert np.allclose(np.diag(r), 1.0)
     # 明显非 PSD 拒绝
     try:
         build_correlation_matrix(("a", "b", "c"),
@@ -126,3 +128,143 @@ def test_psd_repair_accepts_tiny_negative_eigenvalue():
         assert False, "应当拒绝非半正定矩阵"
     except CorrelationError:
         pass
+
+
+def test_perfect_correlation_singular_matrix_accepted():
+    # 两个非零标准不确定度输入、r 恰为 ±1：矩阵奇异（零特征值）但合法，必须接受
+    from app.engine import build_correlation_matrix
+    for r in (1.0, -1.0):
+        corr = build_correlation_matrix(("a", "b"), [("a", "b", r)], set())
+        evals = np.linalg.eigvalsh(corr)
+        assert abs(evals[0]) < 1e-12
+        assert abs(evals[1] - 2.0) < 1e-12
+        # Cholesky 在 r=-1 上必然失败，但矩阵不得因此被拒
+        np.testing.assert_allclose(corr, [[1.0, r], [r, 1.0]])
+
+
+def test_correlation_factor_reproduces_matrix():
+    from app.engine import build_correlation_matrix, correlation_factor
+    for r in (1.0, -1.0, 0.3):
+        corr = build_correlation_matrix(("a", "b"), [("a", "b", r)], set())
+        f = correlation_factor(corr)
+        np.testing.assert_allclose(f @ f.T, corr, atol=1e-12)
+    # 正定矩阵仍走 Cholesky（下三角）
+    f = correlation_factor(build_correlation_matrix(("a", "b"), [("a", "b", 0.5)], set()))
+    assert abs(float(f[0, 1])) < 1e-15
+
+
+def test_reject_threshold_is_one_e_minus_eight():
+    # 最小特征值 < -1e-8 必须拒绝；[-1e-8, 0) 的舍入误差修复放行（保单位对角）
+    from app.engine import build_correlation_matrix, CorrelationError
+
+    def mat3(r_ab, r_bc, r_ac):
+        return build_correlation_matrix(
+            ("a", "b", "c"),
+            [("a", "b", r_ab), ("b", "c", r_bc), ("a", "c", r_ac)], set(),
+        )
+
+    # 矛盾的 ±1 组合：特征值 1±√3，最小 ≈ -0.73
+    try:
+        mat3(1.0, 1.0, -1.0)
+        assert False, "明显非 PSD 必须拒绝"
+    except CorrelationError:
+        pass
+
+    pairs = [
+        ("a", "b", 1.0 - 1e-11),
+        ("a", "c", 1.0 - 1e-11),
+        ("b", "c", 0.9999999995),
+    ]
+    raw = np.eye(3)
+    raw[0, 1] = raw[1, 0] = pairs[0][2]
+    raw[0, 2] = raw[2, 0] = pairs[1][2]
+    raw[1, 2] = raw[2, 1] = pairs[2][2]
+    assert -1e-8 <= np.linalg.eigvalsh(raw)[0] < 0
+    fixed = mat3(*[p[2] for p in pairs])
+    assert np.min(np.linalg.eigvalsh(fixed)) >= -1e-12
+    np.testing.assert_allclose(np.diag(fixed), 1.0)
+
+
+def _linear_sum_ctx():
+    from app.expressions import compile_expression
+    from app.units import build_unit_context, parse_unit
+    expr = compile_expression("a + b", ("a", "b"))
+    units = {"a": parse_unit("dimensionless"), "b": parse_unit("dimensionless")}
+    ctx = build_unit_context(expr, units, "dimensionless")
+    return expr, ctx
+
+
+def test_gum_perfect_correlation_uncertainty_is_abs_sum():
+    # y = a + b、正态输入：GUM 标准不确定度必须为 |ua + r·ub|
+    from app.engine import build_correlation_matrix, run_gum
+    expr, ctx = _linear_sum_ctx()
+    x = ctx.nominal_to_base({"a": 3.0, "b": 5.0})
+    ua, ub = 0.1, 0.2
+    std = np.array([ua, ub])
+    for r, expected in ((1.0, ua + ub), (-1.0, abs(ua - ub))):
+        corr = build_correlation_matrix(("a", "b"), [("a", "b", r)], set())
+        g = run_gum(expr, ("a", "b"), x, std, corr, ctx)
+        assert abs(g.y - 8.0) < 1e-9
+        assert abs(g.uc - expected) < 1e-9, (r, g.uc, expected)
+
+    # ua == ub、r = -1：完全抵消，uc = 0，覆盖区间退化为点
+    corr = build_correlation_matrix(("a", "b"), [("a", "b", -1.0)], set())
+    g = run_gum(expr, ("a", "b"), x, np.array([0.1, 0.1]), corr, ctx)
+    assert g.uc == 0.0
+    assert g.coverage_low == g.coverage_high == 8.0
+
+
+def test_monte_carlo_perfect_correlation_directions():
+    # 固定种子下：r=+1 标准化输入同向（ua+ub），r=-1 反向（|ua-ub|）
+    from app.engine import (
+        build_correlation_matrix, correlation_factor, run_monte_carlo,
+    )
+    expr, ctx = _linear_sum_ctx()
+    x = {"a": 0.0, "b": 0.0}
+    ua, ub = 0.1, 0.2
+    std = np.array([ua, ub])
+
+    for r, expected_sd in ((1.0, ua + ub), (-1.0, abs(ua - ub))):
+        corr = build_correlation_matrix(("a", "b"), [("a", "b", r)], set())
+        mc = run_monte_carlo(
+            expr, ("a", "b"), ("normal", "normal"), x, std, corr,
+            n_draws=20_000, seed=20240101, ctx=ctx, convergence_tol=0.05,
+        )
+        assert mc.converged, mc.nonconvergence_reasons
+        assert abs(mc.std - expected_sd) < 5e-3, (r, mc.std, expected_sd)
+
+    # 因子 + 对齐后的逐样本方向关系（直接检查标准化正态）
+    rng = np.random.default_rng(7)
+    w = rng.standard_normal(size=(2, 1000))
+    from app.engine import _align_perfectly_correlated
+    for r in (1.0, -1.0):
+        corr = build_correlation_matrix(("a", "b"), [("a", "b", r)], set())
+        z = _align_perfectly_correlated(correlation_factor(corr) @ w, corr)
+        if r == 1.0:
+            np.testing.assert_array_equal(z[0], z[1])
+        else:
+            np.testing.assert_array_equal(z[0], -z[1])
+
+
+def test_three_way_perfect_correlation_singular_block():
+    # 三个完全相关变量（r 全为 1）：秩 1 的奇异矩阵，也必须能登记与抽样
+    from app.expressions import compile_expression
+    from app.units import build_unit_context, parse_unit
+    from app.engine import build_correlation_matrix, run_monte_carlo
+    names = ("a", "b", "c")
+    pairs = [("a", "b", 1.0), ("a", "c", 1.0), ("b", "c", 1.0)]
+    corr = build_correlation_matrix(names, pairs, set())
+    evals = np.linalg.eigvalsh(corr)
+    np.testing.assert_allclose(sorted(evals), [0.0, 0.0, 3.0], atol=1e-10)
+
+    expr = compile_expression("a + b + c", names)
+    units = {k: parse_unit("dimensionless") for k in names}
+    ctx = build_unit_context(expr, units, "dimensionless")
+    std = np.array([0.1, 0.2, 0.3])
+    mc = run_monte_carlo(
+        expr, names, ("normal",) * 3, {k: 0.0 for k in names}, std, corr,
+        n_draws=5000, seed=11, ctx=ctx, convergence_tol=0.05,
+    )
+    assert mc.converged, mc.nonconvergence_reasons
+    # 完全同向：y 的标准差 = ua + ub + uc
+    assert abs(mc.std - 0.6) < 1e-2
