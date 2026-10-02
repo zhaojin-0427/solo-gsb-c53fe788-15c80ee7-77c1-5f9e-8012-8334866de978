@@ -283,3 +283,80 @@ def test_domain_negative_log_rejected(client):
     r = client.post("/api/v1/evaluations", json=p)
     assert r.status_code == 422
     assert "非有限" in r.json()["message"]
+
+
+def _perfect_corr_model(version, r):
+    return {
+        "version": version,
+        "name": "完全相关求和",
+        "expression": "a + b",
+        "inputs": [
+            {"name": "a", "value": 1.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.3, "distribution": "normal"},
+            {"name": "b", "value": 2.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [{"i": "a", "j": "b", "r": r}],
+    }
+
+
+def test_perfect_positive_correlation_flow(client):
+    # r = 1（奇异半正定矩阵）：此前被 Cholesky 校验误拒为 422，现在必须可登记、可计算、可查询
+    m = _perfect_corr_model("sum-corr-pos1", 1.0)
+    r = client.post("/api/v1/models", json=m)
+    assert r.status_code == 201, r.text
+
+    p = {
+        "model_version": "sum-corr-pos1",
+        "inputs": m["inputs"],
+        "correlations": m["correlations"],
+        "n": 20000,
+        "seed": 11,
+        "idempotency_key": "key-0010-perfect-pos",
+    }
+    r = client.post("/api/v1/evaluations", json=p)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    gum = body["result"]["combined"]["gum"]
+    # GUM：uc = |ua + r·ub| = 0.3 + 0.1 = 0.4
+    assert gum["value"] == 3.0
+    assert abs(gum["standard_uncertainty"] - 0.4) < 1e-6
+    # MC 与 GUM 一致（两个标准化输入同向变化 => 方差叠加）
+    mc = body["result"]["combined"]["monte_carlo"]
+    assert abs(mc["standard_uncertainty"] - 0.4) < 1e-2
+    assert body["result"]["convergence"]["converged"] is True
+    # 结果可查询
+    one = client.get(f"/api/v1/evaluations/{body['id']}")
+    assert one.status_code == 200
+    assert one.json()["result"]["combined"] == body["result"]["combined"]
+
+
+def test_perfect_negative_correlation_flow(client):
+    # r = -1：反向完全相关，uc = |ua - ub| = 0.2
+    m = _perfect_corr_model("sum-corr-neg1", -1.0)
+    r = client.post("/api/v1/models", json=m)
+    assert r.status_code == 201, r.text
+
+    p = {
+        "model_version": "sum-corr-neg1",
+        "inputs": m["inputs"],
+        "correlations": m["correlations"],
+        "n": 20000,
+        "seed": 12,
+        "idempotency_key": "key-0011-perfect-neg",
+    }
+    r = client.post("/api/v1/evaluations", json=p)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    gum = body["result"]["combined"]["gum"]
+    assert gum["value"] == 3.0
+    assert abs(gum["standard_uncertainty"] - 0.2) < 1e-6
+    mc = body["result"]["combined"]["monte_carlo"]
+    assert abs(mc["standard_uncertainty"] - 0.2) < 1e-2
+    assert body["result"]["convergence"]["converged"] is True
+    # 幂等重放仍命中同一结果
+    r2 = client.post("/api/v1/evaluations", json=p)
+    assert r2.status_code == 200
+    assert r2.json()["cached"] is True
+    assert r2.json()["id"] == body["id"]

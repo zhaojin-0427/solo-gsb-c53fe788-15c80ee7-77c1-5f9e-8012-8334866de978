@@ -39,8 +39,10 @@ def build_correlation_matrix(
 
     * 对称、对角为 1、|r| <= 1；
     * 不允许引用标准不确定度为 0 的输入量（相关系数在那里无定义）；
-    * 必须半正定；对微小负特征值（浮点误差级别）做钳位修复，
-      明显非半正定则拒绝。
+    * 必须半正定，但**允许奇异**（零特征值）：r = ±1 的完全相关是合法物理情形，
+      抽样阶段用特征分解因子处理（见 :func:`_correlation_factor`）；
+    * 最小特征值落在 [-1e-8, 0) 的浮点舍入误差投影修复到半正定（保持单位对角），
+      低于 -1e-8 的明显非半正定矩阵拒绝。
     """
     n = len(names)
     idx = {name: k for k, name in enumerate(names)}
@@ -77,20 +79,23 @@ def build_correlation_matrix(
             f"相关矩阵不是半正定矩阵：最小特征值 {worst:.3e} < -{tol:.1e}"
         )
 
-    # 浮点钳位：用 Higham 交替投影把矩阵投影到相关矩阵锥（保对角 1 + 半正定）
+    # 浮点钳位：用 Higham 交替投影把矩阵投影到相关矩阵锥（保对角 1 + 半正定）。
+    # 注意：完全相关（r=±1）的矩阵本来就是奇异的，零特征值原样保留，
+    # 不再要求 Cholesky 可分解。
     if eig[0] < 0:
         rmat = _nearest_correlation_matrix(rmat)
+        if np.linalg.eigvalsh(rmat)[0] < -1e-10:  # pragma: no cover - 防御式
+            raise CorrelationError("相关矩阵投影修复后仍不是半正定矩阵")
 
-    try:
-        np.linalg.cholesky(rmat)
-    except np.linalg.LinAlgError as exc:
-        raise CorrelationError("相关矩阵无法进行 Cholesky 分解") from exc
     return rmat
 
 
 def _nearest_correlation_matrix(a: np.ndarray, max_iter: int = 100) -> np.ndarray:
-    """Dykstra 交替投影求最近相关矩阵（Higham 2002 简化版）。"""
-    n = a.shape[0]
+    """Dykstra 交替投影求最近相关矩阵（Higham 2002 简化版）。
+
+    收敛判据只看半正定与单位对角；奇异（零特征值）结果合法——
+    完全相关的目标矩阵本身就是奇异的，不要求 Cholesky 可分解。
+    """
     y = a.copy()
     delta = np.zeros_like(a)
     for _ in range(max_iter):
@@ -105,12 +110,24 @@ def _nearest_correlation_matrix(a: np.ndarray, max_iter: int = 100) -> np.ndarra
         y = x / np.outer(d, d)
         np.fill_diagonal(y, 1.0)
         if np.min(np.linalg.eigvalsh(y)) >= -1e-12:
-            try:
-                np.linalg.cholesky(y)
-                return y
-            except np.linalg.LinAlgError:
-                pass
+            break
     return y
+
+
+def _correlation_factor(corr: np.ndarray) -> np.ndarray:
+    """返回满足 ``L @ L.T == corr`` 的方阵因子（用于相关正态抽样 Z = L W）。
+
+    非奇异矩阵用 Cholesky 分解（与既有行为位级一致，保证旧请求结果不变）；
+    奇异半正定矩阵（如 r=±1 完全相关）退化为特征分解平方根
+    ``L = Q·sqrt(Λ)``：零特征值方向自然消失，完全相关的输入由同一组
+    标准正态变量驱动——r=1 时两路标准化样本同向、r=-1 时反向。
+    """
+    try:
+        return np.linalg.cholesky(corr)
+    except np.linalg.LinAlgError:
+        evals, evecs = np.linalg.eigh(corr)
+        evals = np.clip(evals, 0.0, None)  # 钳掉 -1e-16 量级的浮点残差
+        return evecs * np.sqrt(evals)
 
 
 # ---------------------------------------------------------------------------
@@ -322,11 +339,8 @@ def run_monte_carlo(
     n = len(names)
     means = np.array([x_base[name] for name in names], dtype=float)
 
-    # 相关标准正态：Z = L W
-    try:
-        lower = np.linalg.cholesky(corr)
-    except np.linalg.LinAlgError as exc:  # pragma: no cover - 前面已校验
-        raise CorrelationError("相关矩阵无法进行 Cholesky 分解") from exc
+    # 相关标准正态：Z = L W；L 支持奇异相关矩阵（完全相关时零特征值方向消失）
+    lower = _correlation_factor(corr)
     w = rng.standard_normal(size=(n, n_draws))
     z = lower @ w
     u = _phi(z)

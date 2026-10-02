@@ -5,7 +5,7 @@
 客户端登记带单位的输入量（名义值、标准不确定度、分布、两两相关系数）与**不可变版本化测量模型**（表达式仅允许白名单算子/函数）；提交计算请求后，服务依次执行：
 
 1. **单位换算与维度校验**（Pint）——输入快照换算到模型声明单位，推导表达式量纲并与输出单位核对；
-2. **相关矩阵校验**——对称、对角为 1、|r|≤1、半正定（Cholesky；浮点误差级别的近奇异矩阵按 Higham 最近相关矩阵算法修复，明显非半正定拒绝）；
+2. **相关矩阵校验**——对称、对角为 1、|r|≤1、半正定（特征值判据；**允许奇异**——r=±1 的完全相关是合法情形，零特征值矩阵正常登记；最小特征值落在 [-1e-8, 0) 的浮点误差按 Higham 最近相关矩阵算法修复到半正定并保持单位对角，低于 -1e-8 的明显非半正定矩阵拒绝）；
 3. **GUM 一阶线性化**（JCGM 100:2008）——合成标准不确定度、95% 覆盖区间、解析灵敏度系数与逐输入方差贡献；
 4. **固定种子蒙特卡洛**（N ∈ [1000, 100000]，Gaussian copula 保证相关结构与边际分布同时精确）——合成值、2.5%/97.5% 分位覆盖区间、逐输入相关贡献与收敛统计。
 
@@ -27,6 +27,7 @@
   - [4. 查询结果](#4-查询结果)
   - [5. 等价单位写法](#5-等价单位写法)
   - [6. 拒绝场景示例](#6-拒绝场景示例)
+  - [7. 完全相关（r=±1，奇异相关矩阵）](#7-完全相关r1奇异相关矩阵)
 - [模型表达式白名单](#模型表达式白名单)
 - [分布与相关系数](#分布与相关系数)
 - [结果字段说明](#结果字段说明)
@@ -194,7 +195,7 @@ curl -sS -X POST http://localhost:8000/api/v1/evaluations \
     "convergence": {
       "n": 20000, "seed": 20260929, "kurtosis_excess": 0.0006,
       "se_mean": 0.00247, "se_std": 0.00175,
-      "se_quantile_low": 0.00343, "se_quantile_high": 0.00345,
+      "se_quantile_low": 0.00631, "se_quantile_high": 0.00679,
       "rel_se_mean": 0.000124, "rel_se_std": 0.0050, "rel_se_quantile": 0.0050,
       "tolerance": 0.05, "converged": true
     }
@@ -249,6 +250,90 @@ curl -sS http://localhost:8000/api/v1/idempotency/demo-power-0001
 | 抽样越过模型定义域（如对正态量取 sqrt/log 产生 NaN） | 422 | `PropagationError: 蒙特卡洛抽样中模型产生了 k/N 个非有限结果 ...` |
 | 幂等键绑定到不同请求 / 模型版本重复 | 409 | `ConflictError` |
 
+### 7. 完全相关（r=±1，奇异相关矩阵）
+
+两个输入的标准不确定度均大于零、相关系数恰为 `1` 或 `-1` 时，相关矩阵是**奇异半正定**矩阵（含零特征值）。这类矩阵**可以正常登记与计算**——校验采用特征值判据而非 Cholesky 分解，抽样在零特征值方向自动退化（见 [分布与相关系数](#分布与相关系数)）。
+
+以 `y = a + b` 为例：a = 1.00(30) V、b = 2.00(10) V（括号内为标准不确定度，均为正态分布），r = 1：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/models \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "emf-series-v1",
+    "name": "串联电势求和 y = a + b",
+    "expression": "a + b",
+    "inputs": [
+      {"name": "a", "value": 1.0, "unit": "V", "standard_uncertainty": 0.3, "distribution": "normal"},
+      {"name": "b", "value": 2.0, "unit": "V", "standard_uncertainty": 0.1, "distribution": "normal"}
+    ],
+    "output_unit": "V",
+    "correlations": [{"i": "a", "j": "b", "r": 1.0}]
+  }'
+```
+
+返回 `201`（此前版本会因 Cholesky 校验误拒为 422）：
+
+```json
+{
+  "version": "emf-series-v1",
+  "expression_canonical": "a + b",
+  "correlations": [["a", "b", 1.0]]
+}
+```
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/evaluations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "emf-series-v1",
+    "inputs": [
+      {"name": "a", "value": 1.0, "unit": "V", "standard_uncertainty": 0.3, "distribution": "normal"},
+      {"name": "b", "value": 2.0, "unit": "V", "standard_uncertainty": 0.1, "distribution": "normal"}
+    ],
+    "correlations": [{"i": "a", "j": "b", "r": 1.0}],
+    "n": 20000,
+    "seed": 20261002,
+    "idempotency_key": "demo-perfect-corr-0001"
+  }'
+```
+
+返回 `201`（节选；数值随种子确定，可复现）：
+
+```json
+{
+  "id": "7f038b1a0ed942cd99f23cc731e43721",
+  "cached": false,
+  "result": {
+    "combined": {
+      "gum": {
+        "value": 3.0,
+        "standard_uncertainty": 0.4,
+        "coverage_interval": {"low": 2.2160, "high": 3.7840},
+        "coverage_factor": 1.95996,
+        "unit": "V"
+      },
+      "monte_carlo": {
+        "mean": 3.0019,
+        "standard_uncertainty": 0.40289,
+        "median": 3.0001,
+        "coverage_interval": {"low": 2.2102, "high": 3.7937},
+        "samples_range": {"min": 1.3413, "max": 4.4791},
+        "unit": "V"
+      }
+    },
+    "contributions": {
+      "monte_carlo": [
+        {"source": "a", "pearson_r": 1.0, "r_squared": 1.0},
+        {"source": "b", "pearson_r": 1.0, "r_squared": 1.0}
+      ]
+    }
+  }
+}
+```
+
+> 理论验证：y = a + b 且灵敏度均为 1 时，u²(y) = u_a² + u_b² + 2·r·u_a·u_b = (u_a + r·u_b)²，故 **GUM 合成标准不确定度 u(y) = |u_a + r·u_b|**。r=1 时 u(y) = 0.3+0.1 = 0.4 V（同向叠加）；r=-1 时 u(y) = |0.3−0.1| = 0.2 V（反向抵消）。固定种子抽样中两个标准化输入严格同向（r=1，z_b == z_a）或反向（r=-1，z_b == −z_a）变化——上例蒙特卡洛诊断里两个输入与输出的 Pearson r 均恰为 1.0 正是这一性质的体现。
+
 ## 模型表达式白名单
 
 表达式在服务端经 Python AST 解析后**逐节点白名单校验**，不经过任何 `eval`：
@@ -275,7 +360,7 @@ curl -sS http://localhost:8000/api/v1/idempotency/demo-power-0001
 | `uniform` | 以 x 为中心、宽度 2a 的均匀分布，u = a/√3 | x + u·√3·(2v−1) |
 | `triangular` | 对称三角分布（支撑 ±a，峰值在中心），u = a/√6 | x + u·√6·T，T∈[−1,1] |
 
-相关性通过 Gaussian copula 引入：先用 Cholesky 生成相关标准正态，再经正态 CDF 与目标分布分位数函数映射，因此**边际分布精确且相关结构正确**。
+相关性通过 Gaussian copula 引入：先把相关矩阵分解为方阵因子 `L`（非奇异时用 Cholesky 分解；**奇异矩阵**——如 r=±1 完全相关——退化为特征分解平方根 `L = Q·√Λ`，零特征值方向自然消失），由 `Z = L·W` 生成相关标准正态，再经正态 CDF 与目标分布分位数函数映射，因此**边际分布精确且相关结构正确**。r=1 时两路标准化样本逐点相同（同向），r=-1 时逐点相反（反向）。
 
 ## 结果字段说明
 
@@ -304,7 +389,7 @@ pip install -r requirements.txt pytest httpx
 python -m pytest -q
 ```
 
-测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝/浮点修复、GUM 解析解对比、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口等（28 个用例）。
+测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝/浮点修复、奇异相关矩阵（r=±1）登记与抽样方向、GUM 解析解对比（含 u(y)=|u_a+r·u_b|）、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口等（35 个用例）。
 
 ## 项目结构
 
